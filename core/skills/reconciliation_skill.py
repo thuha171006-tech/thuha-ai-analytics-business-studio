@@ -89,6 +89,55 @@ def get_safe_scalar(row: Any, key: str, default: Any = None) -> Any:
         pass
     return val
 
+def check_dataset_validity(df_tx: pd.DataFrame) -> Tuple[bool, str]:
+    """
+    Checks if transactions dataframe is structurally sound and has meaningful data.
+    Returns (is_valid, reason).
+    NOTE: Row and Column maximum limits have been completely removed per user request.
+    """
+    if df_tx is None or df_tx.empty or len(df_tx) == 0:
+        return False, "TỆP RỖNG: Tệp không có bất kỳ dòng dữ liệu nào (0 dòng, 0 cột hoặc chỉ chứa khoảng trắng). Không thể tính toán vì không có dữ liệu để xử lý!"
+
+    # 1. ĐÃ BỎ HOÀN TOÀN GIỚI HẠN SỐ HÀNG VÀ CỘT THEO YÊU CẦU NGƯỜI DÙNG
+    # Hệ thống hỗ trợ xử lý không giới hạn số dòng (>20.000 dòng) và không giới hạn số cột (>200 cột).
+
+    # 2. Check if all cells are dummy ('x', '-', blanks)
+    dummy_patterns = {"x", "X", "-", "--", "---", "n/a", "na", "null", "none", "", "nan", "?", ".", "0", "0.0"}
+    non_dummy_cells = 0
+    for col in df_tx.columns:
+        s = df_tx[col].dropna().astype(str).str.strip()
+        non_dummy = s[~s.str.lower().isin(dummy_patterns)]
+        non_dummy_cells += len(non_dummy)
+        
+    if non_dummy_cells == 0:
+        return False, "TỆP DỮ LIỆU RỖNG / KÝ TỰ GIỮ CHỖ: Toàn bộ bảng tính chỉ chứa các ký tự giữ chỗ (như 'x', '-', ô trống) mà không có dữ liệu thực tế."
+
+    # 3. Check for pure error index files (like Mã dòng + Giá trị 0..N)
+    cols_norm = [str(c).lower().replace("_", " ").strip() for c in df_tx.columns]
+    if any("mã dòng" in c or "ma dong" in c or "err" in c for c in cols_norm) and not any(m in c for c in cols_norm for m in ["doanh thu", "thành tiền", "đơn giá", "sản lượng", "lỗi", "khách"]):
+        for col in df_tx.columns:
+            vals = pd.to_numeric(df_tx[col], errors='coerce').dropna()
+            if len(vals) > 50 and (vals.diff().iloc[1:] == 1).all():
+                return False, f"TỆP MÃ LỖI / SỐ THỨ TỰ: Tệp chỉ chứa mã dòng và số thứ tự đếm dòng (0 đến {len(vals)-1:,}) mà không có số liệu tài chính hay nghiệp vụ thực tế. Không thể tính toán!"
+        return False, "TỆP MÃ LỖI / SỐ THỨ TỰ: Tệp chỉ chứa mã lỗi và số thứ tự đếm dòng mà không có số liệu thực tế. Không thể tính toán!"
+
+    # 4. Check for meaningful numeric/business metrics
+    # Hỗ trợ đa dạng nghiệp vụ: Doanh thu bán hàng, Sản xuất/Chất lượng, Cohort giữ chân, Đăng ký SaaS...
+    has_meaningful_numbers = False
+    for col in df_tx.columns:
+        # Check if column has non-trivial numbers
+        num_s = df_tx[col].apply(clean_currency_str)
+        if (num_s != 0).any():
+            pos_vals = num_s[num_s != 0]
+            if len(pos_vals) > 0:
+                has_meaningful_numbers = True
+                break
+
+    if not has_meaningful_numbers:
+        return False, "THIẾU SỐ LIỆU: Tệp không có thông tin số liệu hợp lệ (chỉ chứa văn bản hoặc ký tự trống). Vui lòng kiểm tra lại file!"
+        
+    return True, "Dữ liệu hợp lệ"
+
 class ReconciliationSkill:
     def __init__(self, audit_logger: AuditLogger):
         self.logger = audit_logger
@@ -111,9 +160,72 @@ class ReconciliationSkill:
         
         # 1. Transactions
         df_tx = data.get("transactions", pd.DataFrame()).copy()
+        is_valid, invalid_reason = check_dataset_validity(df_tx)
+        
+        if not is_valid:
+            df_tx_zero = pd.DataFrame()  # HOÀN TOÀN RỖNG KHI TỆP LỖI / RỖNG!
+            cleaned_data["transactions"] = df_tx_zero
+            cleaned_data["promotions"] = pd.DataFrame()
+            cleaned_data["products"] = pd.DataFrame()
+            cleaned_data["costs"] = pd.DataFrame()
+            
+            exc = {
+                "type": "EMPTY_OR_DUMMY_DATASET",
+                "item_id": "Toàn bộ tệp",
+                "description": invalid_reason,
+                "impact": "Tệp không chứa số liệu kinh doanh thực tế. Hệ thống đặt toàn bộ số liệu bằng 0 và không đưa ra phân tích hay định hướng.",
+                "ai_solution": "Vui lòng tải tệp chứa số liệu bán hàng thực tế (doanh thu, đơn giá, số lượng hợp lệ).",
+                "status": "DATA_REJECTED"
+            }
+            exceptions.append(exc)
+            self.logger.log_anomaly(exc["type"], exc["item_id"], exc["description"], "Đặt toàn bộ số liệu về 0 do tệp không có dữ liệu thực")
+            return cleaned_data, exceptions
+
         if not df_tx.empty:
-            # First: Standardize numeric types using regex normalizer (Handles VND, $, 100k, 1.000.000, 1,000,000)
-            # Clean numeric amounts and ensure gross_amount is NEVER overwritten with 0
+            # 1. Standardize column names from Vietnamese aliases
+            alias_map = {
+                "gross_amount": ["doanh thu", "doanh_thu", "doanh số", "thành tiền", "thanh tien", "tổng tiền", "tong tien", "gross_amount", "gross_revenue", "revenue", "sales"],
+                "date": ["tháng", "thang", "ngày", "ngay", "date", "time", "thời gian", "thoi gian", "period", "kỳ"],
+                "channel": ["kênh", "kenh", "channel", "platform", "sàn", "kênh bán"],
+                "region": ["khu vực", "khu vuc", "region", "vùng", "vung", "địa bàn", "dia ban", "miền", "mien"],
+                "order_id": ["mã đơn", "ma don", "mã đơn hàng", "order_id", "order id", "mã đh", "số đơn", "order_code"],
+                "product_id": ["mã sp", "ma sp", "mã sản phẩm", "product_id", "product id", "sku", "mã hàng", "tên sp", "tên sản phẩm", "product_name"],
+                "unit_price": ["đơn giá", "don gia", "unit_price", "giá bán", "gia ban"],
+                "quantity": ["số lượng", "so luong", "quantity", "qty"],
+                "cogs": ["giá vốn", "gia von", "cogs", "cost", "tiền vốn", "chi phí vốn"],
+                "discount_amount": ["chiết khấu", "chiet khau", "voucher", "discount", "khuyến mãi", "giảm giá"],
+                "return_amount": ["hàng trả", "hang tra", "hoàn", "hoan", "return", "refund", "trả hàng", "hàng hoàn"]
+            }
+            
+            detected_fields = {}
+            for target_key, patterns in alias_map.items():
+                for col in df_tx.columns:
+                    c_low = str(col).lower().strip()
+                    if target_key == "gross_amount" and any(k in c_low for k in ["cơ hội", "tiềm năng", "pipeline", "tiền thu trước", "doanh thu tháng", "sản lượng", "số lỗi"]):
+                        continue
+                    if any(p in c_low for p in patterns):
+                        detected_fields[target_key] = col
+                        if target_key not in df_tx.columns:
+                            df_tx[target_key] = df_tx[col]
+                        break
+
+            # Track missing fields
+            missing_fields = []
+            if "order_id" not in detected_fields:
+                missing_fields.append("Mã đơn hàng (Order ID)")
+                df_tx["order_id"] = [f"-- (Dòng {i+1})" for i in range(len(df_tx))]
+            if "product_id" not in detected_fields:
+                missing_fields.append("Mã sản phẩm (Product SKU)")
+                df_tx["product_id"] = "-- (Không có trong file)"
+            if "cogs" not in detected_fields:
+                missing_fields.append("Giá vốn hàng bán (COGS)")
+                df_tx["cogs"] = 0.0  # KHÔNG TỰ BỊA GIÁ VỐN KHI FILE KHÔNG CÓ CỘT GIÁ VỐN
+            if "discount_amount" not in detected_fields:
+                df_tx["discount_amount"] = 0.0
+            if "return_amount" not in detected_fields:
+                df_tx["return_amount"] = 0.0
+
+            # 2. Standardize numeric types
             if "gross_amount" in df_tx.columns:
                 df_tx["gross_amount"] = df_tx["gross_amount"].apply(clean_currency_str)
             else:
@@ -122,30 +234,19 @@ class ReconciliationSkill:
             if "unit_price" in df_tx.columns:
                 df_tx["unit_price"] = df_tx["unit_price"].apply(clean_currency_str)
             else:
-                df_tx["unit_price"] = 0.0
+                df_tx["unit_price"] = df_tx["gross_amount"]
 
             if "quantity" in df_tx.columns:
                 df_tx["quantity"] = df_tx["quantity"].apply(clean_currency_str).replace(0, 1)
             else:
                 df_tx["quantity"] = 1.0
 
-            # Dynamic cross-imputation: compute gross_amount and unit_price from each other
+            # Dynamic cross-imputation
             mask_has_gross = (df_tx["gross_amount"] > 0) & (df_tx["unit_price"] <= 0)
             df_tx.loc[mask_has_gross, "unit_price"] = df_tx.loc[mask_has_gross, "gross_amount"] / df_tx.loc[mask_has_gross, "quantity"]
 
             mask_has_price = (df_tx["unit_price"] > 0) & (df_tx["gross_amount"] <= 0)
             df_tx.loc[mask_has_price, "gross_amount"] = df_tx.loc[mask_has_price, "unit_price"] * df_tx.loc[mask_has_price, "quantity"]
-
-            # If both are still <= 0, scan remaining columns for any revenue/price keyword:
-            if (df_tx["gross_amount"] <= 0).all() and (df_tx["unit_price"] <= 0).all():
-                for alt_col in df_tx.columns:
-                    alt_lower = str(alt_col).lower()
-                    if any(k in alt_lower for k in ["tiền", "tien", "doanh", "thu", "amount", "total", "revenue", "price", "giá", "gia"]):
-                        parsed_col = df_tx[alt_col].apply(clean_currency_str)
-                        if parsed_col.sum() > 0:
-                            df_tx["gross_amount"] = parsed_col
-                            df_tx["unit_price"] = df_tx["gross_amount"] / df_tx["quantity"]
-                            break
 
             if "return_amount" in df_tx.columns:
                 df_tx["return_amount"] = df_tx["return_amount"].apply(clean_currency_str)
@@ -157,10 +258,22 @@ class ReconciliationSkill:
             else:
                 df_tx["discount_amount"] = 0.0
 
-            if "cogs" in df_tx.columns:
+            if "cogs" in detected_fields and "cogs" in df_tx.columns:
                 df_tx["cogs"] = df_tx["cogs"].apply(clean_currency_str)
             else:
-                df_tx["cogs"] = df_tx["unit_price"] * cogs_default_ratio
+                df_tx["cogs"] = 0.0  # KHÔNG BỊA 65%
+
+            if missing_fields:
+                total_rev_file = df_tx['gross_amount'].sum()
+                exc = {
+                    "type": "DATASET_MISSING_FIELDS",
+                    "item_id": f"{len(missing_fields)} trường bị thiếu",
+                    "description": f"Tệp tải lên thiếu các trường thông tin: {', '.join(missing_fields)}. Hệ thống giữ nguyên số liệu thực tế từ file và không tự động suy đoán.",
+                    "impact": f"Chỉ ghi nhận Doanh thu thực tế ({total_rev_file:,.0f} đ). Các trường thiếu được hiển thị dưới dạng '--' hoặc 0 đ.",
+                    "ai_solution": "Hiển thị nguyên trạng số liệu thô theo tệp của người dùng, không tạo đơn ảo.",
+                    "status": "PRESERVED_AS_IS"
+                }
+                exceptions.append(exc)
 
             # Category 1A: Guarantee Order ID field exists and is non-empty
             if "order_id" not in df_tx.columns:
@@ -274,25 +387,35 @@ class ReconciliationSkill:
                     exceptions.append(exc)
                     self.logger.log_anomaly(exc["type"], exc["item_id"], exc["description"], "Kiểm tra lại giá bán niêm yết")
 
-            # Apply zero_price_policy if specified
-            if zero_price_policy == "EXCLUDE":
-                zero_mask = (df_tx["unit_price"] <= 0) & (df_tx["gross_amount"] <= 0)
-                if zero_mask.any():
-                    df_tx = df_tx[~zero_mask].copy()
-            elif zero_price_policy == "AUTO_IMPUTE":
-                pos_prices = df_tx.loc[df_tx["unit_price"] > 0, "unit_price"]
-                mean_price = float(pos_prices.mean()) if not pos_prices.empty else 150000.0
-                mask_zero = df_tx["unit_price"] <= 0
-                if mask_zero.any():
-                    df_tx.loc[mask_zero, "unit_price"] = mean_price
-                    if "gross_amount" in df_tx.columns:
-                        df_tx.loc[mask_zero, "gross_amount"] = mean_price * df_tx.loc[mask_zero, "quantity"]
+            # Check if dataset belongs to specialized non-retail domain (Funnel, Quality, Cohort, Subscription, Store)
+            is_non_retail = any(any(k in str(c).lower() for k in ["giai đoạn", "cơ hội", "lead", "pipeline", "dây chuyền", "sản lượng", "lô", "ca", "cohort", "tiền thu trước", "doanh thu tháng", "cửa hàng", "diện tích"]) for c in df_tx.columns)
 
-            # Fallback COGS if missing: Impute standard benchmark COGS ratio from human_overrides
-            if "cogs" not in df_tx.columns or df_tx["cogs"].isna().all():
-                df_tx["cogs"] = df_tx["unit_price"] * cogs_default_ratio
+            # Apply zero_price_policy if specified (only for standard retail datasets where missing price indicates omission)
+            if not is_non_retail:
+                if zero_price_policy == "EXCLUDE":
+                    zero_mask = (df_tx["unit_price"] <= 0) & (df_tx["gross_amount"] <= 0)
+                    if zero_mask.any():
+                        df_tx = df_tx[~zero_mask].copy()
+                elif zero_price_policy == "AUTO_IMPUTE":
+                    pos_prices = df_tx.loc[df_tx["unit_price"] > 0, "unit_price"]
+                    mean_price = float(pos_prices.mean()) if not pos_prices.empty else 0.0
+                    mask_zero = df_tx["unit_price"] <= 0
+                    if mask_zero.any() and mean_price > 0:
+                        df_tx.loc[mask_zero, "unit_price"] = mean_price
+                        if "gross_amount" in df_tx.columns:
+                            df_tx.loc[mask_zero, "gross_amount"] = mean_price * df_tx.loc[mask_zero, "quantity"]
+
+            # Fallback COGS if missing: Only impute for retail orders; non-retail datasets must keep 0.0
+            if is_non_retail:
+                if "cogs" not in df_tx.columns:
+                    df_tx["cogs"] = 0.0
+                else:
+                    df_tx["cogs"] = df_tx["cogs"].fillna(0.0)
             else:
-                df_tx["cogs"] = df_tx["cogs"].fillna(df_tx["unit_price"] * cogs_default_ratio)
+                if "cogs" not in df_tx.columns or df_tx["cogs"].isna().all():
+                    df_tx["cogs"] = df_tx["unit_price"] * cogs_default_ratio
+                else:
+                    df_tx["cogs"] = df_tx["cogs"].fillna(df_tx["unit_price"] * cogs_default_ratio)
             
         cleaned_data["transactions"] = df_tx
 
@@ -364,9 +487,13 @@ class ReconciliationSkill:
         - Handles returns (including late returns)
         """
         approved_overrides = approved_overrides or {}
-        df_tx = cleaned_data["transactions"].copy()
-        df_promo = cleaned_data["promotions"].copy()
-        df_prod = cleaned_data["products"].copy()
+        df_tx = cleaned_data.get("transactions", pd.DataFrame()).copy()
+        df_promo = cleaned_data.get("promotions", pd.DataFrame()).copy()
+        df_prod = cleaned_data.get("products", pd.DataFrame()).copy()
+
+        # If transactions has 0 gross and 0 price, return empty immediately
+        if df_tx.empty or (clean_currency_str(df_tx.get("gross_amount", pd.Series([0])).sum()) <= 0 and clean_currency_str(df_tx.get("unit_price", pd.Series([0])).sum()) <= 0):
+            return pd.DataFrame(), []
 
         self.logger.log_tool_call(
             tool_name="reconcile_orders_and_returns",
@@ -402,7 +529,7 @@ class ReconciliationSkill:
             mask_already_total = (qty > 1) & (df_merged["unit_cogs"] * qty > gross * 1.1) & (df_merged["unit_cogs"] <= gross)
             df_merged["total_cogs"] = df_merged["unit_cogs"] * qty
             df_merged.loc[mask_already_total, "total_cogs"] = df_merged.loc[mask_already_total, "unit_cogs"]
-            df_merged["total_cogs"] = df_merged["total_cogs"].fillna(gross * 0.65)
+            df_merged["total_cogs"] = df_merged["total_cogs"].fillna(0.0)
             df_merged["category"] = "Unknown"
 
         # Check promo usage per order

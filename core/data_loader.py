@@ -54,7 +54,7 @@ COLUMN_MAPPINGS = {
         "doanh thu", "doanh_thu", "doanh số", "doanh_so", "tổng tiền", "tong tien", 
         "tổng_tiền", "tong_tien", "tổng cộng", "tong cong", "tổng_cộng", "tong_cong", 
         "tiền hàng", "tien hang", "thanh toán", "thanh toan", "thanh_toán", 
-        "giá trị", "gia tri", "giá trị đơn", "gia tri don", "thực thu", "thuc thu", 
+        "giá trị đơn", "gia tri don", "giá trị đơn hàng", "giá trị giao dịch", "thực thu", "thuc thu", 
         "revenue", "gross revenue", "total amount", "total", "amount", "sales"
     ],
     "status": [
@@ -148,6 +148,9 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
             if col in col_rename:
                 continue
             col_lower = col.lower()
+            # Protect domain-specific non-eCommerce columns from false substring mapping
+            if any(k in col_lower for k in ["cơ hội", "tiềm năng", "pipeline", "tiền thu trước", "doanh thu tháng", "sản lượng", "số lỗi", "tỷ lệ lỗi", "m0", "m1", "m2", "m3", "m4", "m5"]):
+                continue
             if any(alias in col_lower for alias in aliases if len(alias) >= 4):
                 col_rename[col] = std_col
                 assigned_std.add(std_col)
@@ -195,8 +198,13 @@ class DataLoader:
                 if hasattr(file_path_or_buffer, "seek"):
                     file_path_or_buffer.seek(0)
                 df = pd.read_csv(file_path_or_buffer, encoding="latin1")
+        orig_cols = list(df.columns)
         df_std = standardize_columns(df)
-        return {"transactions": df_std}
+        # Ensure original column values are retained on df_std so the original file headers are intact
+        for c in orig_cols:
+            if c not in df_std.columns and c in df.columns:
+                df_std[c] = df[c]
+        return {"transactions": df_std, "original_columns": orig_cols}
 
     @staticmethod
     def load_from_excel(file_path_or_buffer) -> dict:

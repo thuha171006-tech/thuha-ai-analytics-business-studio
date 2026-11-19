@@ -41,18 +41,37 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
+
+    def _get_request_path(self):
+        for h in ["x-forwarded-uri", "x-matched-path", "x-real-path", "x-vercel-original-path"]:
+            val = self.headers.get(h)
+            if val and not val.endswith("/index.py"):
+                return urllib.parse.urlparse(val).path
+        parsed = urllib.parse.urlparse(self.path).path
+        if parsed == "/api/index.py" or parsed == "/api":
+            return "/"
+        return parsed
 
     def do_OPTIONS(self):
         self._set_headers(200)
 
     def do_GET(self):
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
+        path = self._get_request_path()
 
-        if path == "/" or path == "/index.html":
-            html_path = os.path.join(os.path.dirname(__file__), "ui", "index.html")
-            if os.path.exists(html_path):
+        if path in ["/", "/index.html", "/api/index.py", "/api"]:
+            possible_paths = [
+                os.path.join(os.path.dirname(__file__), "ui", "index.html"),
+                os.path.join(os.getcwd(), "ui", "index.html"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui", "index.html"),
+                "/var/task/ui/index.html",
+            ]
+            html_path = next((p for p in possible_paths if os.path.exists(p)), None)
+            if html_path and os.path.exists(html_path):
                 self._set_headers(200, "text/html")
                 with open(html_path, "rb") as f:
                     self.wfile.write(f.read())
@@ -135,8 +154,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"404 Not Found")
 
     def do_POST(self):
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
+        path = self._get_request_path()
 
         if path == "/api/run_pipeline":
             content_length = int(self.headers.get("Content-Length", 0))
@@ -210,13 +228,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                             "level": "INFO"
                         }
                     ],
-                    "ai_executive_insights": "Hệ thống đang ở trạng thái chờ. Vui lòng tải tệp dữ liệu lên ở Bước 1 để AI Agent bắt đầu phân tích và tính toán P&L."
+                    "ai_executive_insights": "Hệ thống đang ở trạng thái chờ. Vui lòng tải tệp dữ liệu lên ở Bước 1 để AI Agent bắt đầu phân tích và tính toán P&L.",
+                    "question_sufficiency": {
+                        "is_sufficient": True,
+                        "user_question": "",
+                        "what_is_missing": "",
+                        "what_is_needed": "",
+                        "missing_fields": [],
+                        "suggested_questions": []
+                    }
                 }
                 self.wfile.write(safe_json_dumps(empty_res).encode("utf-8"))
                 return
 
             if business_context is None:
                 business_context = {}
+            if params.get("questions"):
+                business_context["questions"] = params.get("questions")
+            if params.get("business_context") and isinstance(params.get("business_context"), dict):
+                business_context.update(params.get("business_context"))
             if file_name:
                 business_context["file_name"] = file_name
                 if not business_context.get("project_name"):
@@ -226,7 +256,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if file_base64 and file_base64.strip():
                     import base64
                     import io
-                    decoded = base64.b64decode(file_base64)
+                    b64_clean = file_base64.strip()
+                    if "," in b64_clean:
+                        b64_clean = b64_clean.split(",", 1)[1].strip()
+                    pad = len(b64_clean) % 4
+                    if pad:
+                        b64_clean += "=" * (4 - pad)
+                    decoded = base64.b64decode(b64_clean)
                     file_buffer = io.BytesIO(decoded)
                     print(f"[PIPELINE] Nhận file tải lên: {file_name} (Bytes: {len(decoded)})")
                     if file_name.lower().endswith(".csv"):
@@ -296,7 +332,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(safe_json_dumps({"answer": "Vui lòng nhập câu hỏi để tôi hỗ trợ phân tích."}).encode("utf-8"))
                     return
 
-                summary = agent_instance.get_summary()
+                summary = payload.get("summary") or agent_instance.get_summary()
                 print(f"[COPILOT] Nhận câu hỏi: '{query}'", flush=True)
                 answer = agent_instance.gemini_service.chat_with_copilot(query, summary)
                 print(f"[COPILOT] Phản hồi thành công ({len(answer)} ký tự)", flush=True)
@@ -308,6 +344,105 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 fallback_ans = f"Trợ lý AI đã ghi nhận câu hỏi: '{query}'. Hệ thống đang phân tích lại dữ liệu P&L và ngoại lệ."
                 self.wfile.write(safe_json_dumps({"answer": fallback_ans}).encode("utf-8"))
+
+        elif path == "/api/export_html_pnl":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                summary = json.loads(safe_decode(post_data)) if post_data else agent_instance.get_summary()
+                if not summary or not isinstance(summary, dict) or ("pnl_table" not in summary and "summary_kpis" not in summary and "financial_kpis" not in summary and "domain_kpis" not in summary):
+                    summary = agent_instance.get_summary()
+            except Exception:
+                summary = agent_instance.get_summary()
+
+            from core.html_exporter import StandaloneHtmlExporter
+            html_content = StandaloneHtmlExporter.generate_pnl_report(summary)
+            data = html_content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=Bao_Cao_Chi_Tiet_PnL_ThuHa.html")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif path == "/api/export_html_dashboard":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                summary = json.loads(safe_decode(post_data)) if post_data else agent_instance.get_summary()
+                if not summary or not isinstance(summary, dict) or ("pnl_table" not in summary and "summary_kpis" not in summary and "financial_kpis" not in summary and "domain_kpis" not in summary):
+                    summary = agent_instance.get_summary()
+            except Exception:
+                summary = agent_instance.get_summary()
+
+            from core.html_exporter import StandaloneHtmlExporter
+            html_content = StandaloneHtmlExporter.generate_dashboard_overview(summary)
+            data = html_content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=Dashboard_Tong_Quan_ThuHa.html")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif path == "/api/export_excel":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                summary = json.loads(safe_decode(post_data)) if post_data else agent_instance.get_summary()
+                if not summary or not isinstance(summary, dict) or ("pnl_table" not in summary and "summary_kpis" not in summary and "financial_kpis" not in summary and "domain_kpis" not in summary):
+                    summary = agent_instance.get_summary()
+            except Exception:
+                summary = agent_instance.get_summary()
+
+            from core.excel_exporter import ExcelReportExporter
+            excel_path = ExcelReportExporter.export(summary, "exports/Bao_Cao_Hieu_Qua_Ban_Hang_ThuHa.xlsx")
+            with open(excel_path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", "attachment; filename=Bao_Cao_Hieu_Qua_Ban_Hang_ThuHa.xlsx")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif path == "/api/export_json":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                summary = json.loads(safe_decode(post_data)) if post_data else agent_instance.get_summary()
+                if not summary or not isinstance(summary, dict) or ("pnl_table" not in summary and "summary_kpis" not in summary and "financial_kpis" not in summary and "domain_kpis" not in summary):
+                    summary = agent_instance.get_summary()
+            except Exception:
+                summary = agent_instance.get_summary()
+
+            data = safe_json_dumps(summary, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=Du_Lieu_Phan_Tich_ThuHa.json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif path == "/api/apply_modification":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                payload = json.loads(safe_decode(post_data))
+                req_text = payload.get("request_text", "")
+                current_data = payload.get("current_data") or agent_instance.get_summary()
+                step = int(payload.get("step", 3))
+
+                from core.modification_engine import DynamicModificationEngine
+                updated_data = DynamicModificationEngine.apply_modification(current_data, req_text, step=step)
+
+                self._set_headers(200)
+                self.wfile.write(safe_json_dumps(updated_data).encode("utf-8"))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._set_headers(500)
+                self.wfile.write(safe_json_dumps({"error": str(e)}).encode("utf-8"))
 
         else:
             self._set_headers(404, "text/plain")

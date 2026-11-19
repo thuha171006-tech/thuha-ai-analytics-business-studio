@@ -18,7 +18,7 @@ def load_env():
 load_env()
 
 # Google Gemini AI Studio API Configuration
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6I62QIBTsipWCkLI-79El8GUlz2xKq_jZ145OR859dmGg")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 # Benchmark business thresholds

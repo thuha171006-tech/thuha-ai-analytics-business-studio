@@ -2,8 +2,17 @@
   "version": 2,
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/api/(.*)",
       "destination": "/api/index.py"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/ui/index.html"
     }
-  ]
+  ],
+  "functions": {
+    "api/index.py": {
+      "includeFiles": "ui/**,core/**"
+    }
+  }
 }
